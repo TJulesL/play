@@ -6,12 +6,12 @@ import pymunk as _pymunk
 import pygame
 
 from ..callback import callback_manager, CallbackType
-from ..globals import sprites_group
+from ..globals import globals_list
 from ..physics import physics_space, Physics as _Physics
 from ..utils import _clamp
 from ..io import screen
 from ..utils.async_helpers import _make_async
-from ..callback.callback_helpers import run_async_callback
+from ..callback.callback_helpers import run_async_callback, run_callback
 
 
 def _sprite_touching_sprite(a, b):
@@ -55,7 +55,7 @@ class Sprite(
         self.rect = None
 
         super().__init__()
-        sprites_group.add(self)
+        globals_list.sprites_group.add(self)
 
     def __setattr__(self, name, value):
         # ignore if it's in the ignored list or if the variable doesn't change
@@ -65,10 +65,19 @@ class Sprite(
                 sprite._should_recompute = True
         super().__setattr__(name, value)
 
-    def update(self):
+    def is_touching_wall(self) -> bool:
+        """Check if the sprite is touching the edge of the screen.
+        :return: Whether the sprite is touching the edge of the screen."""
+        for wall in globals_list.walls:
+            if self.physics._pymunk_shape.shapes_collide(wall).points:
+                return True
+        return False
+
+    def update(self):  # pylint: disable=too-many-nested-blocks, too-many-branches
         """Update the sprite."""
-        if self._should_recompute and callback_manager.get_callback(
-            CallbackType.WHEN_TOUCHING, id(self)
+        if (  # pylint: disable=too-many-nested-blocks
+            self._should_recompute
+            and callback_manager.get_callback(CallbackType.WHEN_TOUCHING, id(self))
         ):
             # check if we are touching any other sprites
             for callback, b in callback_manager.get_callback(
@@ -78,8 +87,42 @@ class Sprite(
                     if callback not in self._active_callbacks:
                         self._active_callbacks.append(callback)
                 else:
+                    if callback_manager.get_callback(
+                        CallbackType.WHEN_STOPPED_TOUCHING, id(self)
+                    ):
+                        for (
+                            stopped_callback,
+                            stopped_b,
+                        ) in callback_manager.get_callback(
+                            CallbackType.WHEN_STOPPED_TOUCHING, id(self)
+                        ):
+                            if stopped_b == b:
+                                if callback in self._active_callbacks:
+                                    run_callback(stopped_callback, [], [])
                     if callback in self._active_callbacks:
                         self._active_callbacks.remove(callback)
+
+        if callback_manager.get_callback(  # pylint: disable=too-many-nested-blocks
+            CallbackType.WHEN_TOUCHING_WALL, id(self)
+        ):
+            for callback in callback_manager.get_callback(
+                CallbackType.WHEN_TOUCHING_WALL, id(self)
+            ):
+                if self.is_touching_wall():
+                    if callback not in self._active_callbacks:
+                        self._active_callbacks.append(callback)
+                else:
+                    if callback_manager.get_callback(
+                        CallbackType.WHEN_STOPPED_TOUCHING_WALL, id(self)
+                    ):
+                        for stopped_callback in callback_manager.get_callback(
+                            CallbackType.WHEN_STOPPED_TOUCHING_WALL, id(self)
+                        ):
+                            if callback in self._active_callbacks:
+                                run_callback(stopped_callback, [], [])
+                    if callback in self._active_callbacks:
+                        self._active_callbacks.remove(callback)
+
         if self._is_hidden:
             self._image = pygame.Surface((0, 0), pygame.SRCALPHA)
         self._should_recompute = False
@@ -226,6 +269,7 @@ You might want to look in your code where you're setting transparency and make s
         self._is_hidden = False
         if self.physics:
             self.physics.unpause()
+            self.physics._make_pymunk()
 
     @property
     def is_hidden(self):
@@ -314,7 +358,7 @@ You might want to look in your code where you're setting transparency and make s
         """Remove the sprite from the screen."""
         if self.physics:
             self.physics._remove()
-        sprites_group.remove(self)
+        globals_list.sprites_group.remove(self)
 
     @property
     def width(self):
@@ -441,6 +485,70 @@ You might want to look in your code where you're setting transparency and make s
 
         return decorator
 
+    def when_stopped_touching(self, *sprites):
+        """Run a function when the sprite is no longer touching another sprite.
+        :param sprites: The sprites to check if they're touching.
+        """
+
+        def decorator(func):
+            async_callback = _make_async(func)
+
+            async def wrapper():
+                await run_async_callback(
+                    async_callback,
+                    [],
+                    [],
+                )
+
+            for sprite in sprites:
+
+                async def wrapper_func():
+                    await wrapper()
+
+                sprite._dependent_sprites.append(self)
+                callback_manager.add_callback(
+                    CallbackType.WHEN_STOPPED_TOUCHING, (wrapper_func, sprite), id(self)
+                )
+            return wrapper
+
+        return decorator
+
+    def when_touching_wall(self, callback):
+        """Run a function when the sprite is touching the edge of the screen.
+        :param callback: The function to run.
+        """
+        async_callback = _make_async(callback)
+
+        async def wrapper():
+            await run_async_callback(
+                async_callback,
+                [],
+                [],
+            )
+
+        callback_manager.add_callback(
+            CallbackType.WHEN_TOUCHING_WALL, wrapper, id(self)
+        )
+        return wrapper
+
+    def when_stopped_touching_wall(self, callback):
+        """Run a function when the sprite is no longer touching the edge of the screen.
+        :param callback: The function to run.
+        """
+        async_callback = _make_async(callback)
+
+        async def wrapper():
+            await run_async_callback(
+                async_callback,
+                [],
+                [],
+            )
+
+        callback_manager.add_callback(
+            CallbackType.WHEN_STOPPED_TOUCHING_WALL, wrapper, id(self)
+        )
+        return wrapper
+
     def _common_properties(self):
         # used with inheritance to clone
         return {
@@ -466,7 +574,7 @@ You might want to look in your code where you're setting transparency and make s
         obeys_gravity=True,
         bounciness=1.0,
         mass=10,
-        friction=0.1,
+        friction=1.0,
     ):
         """Start the physics simulation for this sprite.
         :param can_move: Whether the object can move.
